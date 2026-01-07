@@ -1,0 +1,7 @@
+# 🖼️ ViT Compression Research Benchmarking Tool
+
+[![GitHub stars](https://img.shields.io/github/stars/hamdijaber/ViT-Compression-Research-Benchmarking-tool)](https://github.com/hamdijaber/ViT-Compression-Research-Benchmarking-tool)
+[![DOI](https://zenodo.org/badge/DOIEnter.svg)](https://zenodo.org/badge/latestdoi/XXXXXXX)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+
+**PhD Research Code (ITE705): Comprehensive analysis of PCA, Autoencoder, PQ for ViT features on Oxford5k+Paris6k datasets.**
