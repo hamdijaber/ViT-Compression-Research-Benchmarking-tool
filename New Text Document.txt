@@ -11,7 +11,7 @@ warnings.filterwarnings("ignore")
 
 # --- 1. Environment Setup & Installation ---
 def install_requirements():
-    print("⚙️ Checking and installing required libraries...")
+    print(" Checking and installing required libraries...")
     packages = ["faiss-cpu", "scikit-learn", "numpy", "tqdm", "matplotlib", "gradio", "psutil", "pandas"]
     try:
         import torch_xla
@@ -26,7 +26,7 @@ def install_requirements():
         try:
             __import__(import_name)
         except ImportError:
-            print(f"📦 Installing {package}...")
+            print(f" Installing {package}...")
             subprocess.check_call([sys.executable, "-m", "pip", "install", package, "-q"])
 
 install_requirements()
@@ -594,3 +594,4 @@ with gr.Blocks(title="Research Benchmarking Tool", css=custom_css) as app:
 
 print(" Launching Research Interface...")
 app.launch(share=True, debug=True)
+
