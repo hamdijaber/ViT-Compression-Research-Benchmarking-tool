@@ -1,0 +1,596 @@
+import sys
+import subprocess
+import warnings
+import os
+import time
+import io
+import datetime
+
+# Ignore warnings
+warnings.filterwarnings("ignore")
+
+# --- 1. Environment Setup & Installation ---
+def install_requirements():
+    print("⚙️ Checking and installing required libraries...")
+    packages = ["faiss-cpu", "scikit-learn", "numpy", "tqdm", "matplotlib", "gradio", "psutil", "pandas"]
+    try:
+        import torch_xla
+    except ImportError:
+        packages.append("torch-xla")
+
+    for package in packages:
+        import_name = "faiss" if "faiss" in package else package
+        if import_name == "scikit-learn": import_name = "sklearn"
+        if import_name == "torch-xla": import_name = "torch_xla"
+
+        try:
+            __import__(import_name)
+        except ImportError:
+            print(f"📦 Installing {package}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package, "-q"])
+
+install_requirements()
+
+# --- Imports ---
+import numpy as np
+import pandas as pd
+import faiss
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset, random_split
+from transformers import ViTImageProcessor, ViTModel
+from PIL import Image
+from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics import average_precision_score
+import matplotlib.pyplot as plt
+import psutil
+import gradio as gr
+
+# --- 2. Hardware Configuration ---
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    device = torch_xla.device()
+    device_name = "Google Cloud TPU v2 (8 Cores)"
+    print(" TPU Acceleration Enabled Successfully.")
+except ImportError:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device_name = "NVIDIA T4 GPU" if torch.cuda.is_available() else "Standard CPU"
+    print(f" Runtime Environment: {device_name}")
+
+# --- 3. Paths & Settings ---
+BASE_DIR = '/content/retrieval_data'
+IMAGES_DIR = os.path.join(BASE_DIR, 'images')
+GT_DIR = os.path.join(BASE_DIR, 'ground_truth')
+FEATURES_FILE = os.path.join(BASE_DIR, 'features_combined.npy')
+NAMES_FILE = os.path.join(BASE_DIR, 'names_combined.npy')
+DIMS_TO_TEST = [256, 128, 64]
+
+# --- 4. Helpers ---
+def format_time(seconds):
+    return time.strftime("%M:%S", time.gmtime(seconds))
+
+def get_timestamp():
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+def append_log(history, new_text):
+    separator = "\n" + "="*40 + "\n"
+    timestamp = f"[{get_timestamp()}] "
+    if history:
+        return history + separator + timestamp + new_text
+    return timestamp + new_text
+
+def get_system_metrics():
+    mem = psutil.virtual_memory()
+    ram_total = mem.total / (1024**3)
+    ram_used = mem.used / (1024**3)
+    disk = psutil.disk_usage('/')
+    disk_free = disk.free / (1024**3)
+
+    try:
+        start_io = time.time()
+        with open('speed_test.tmp', 'wb') as f:
+            f.write(os.urandom(50 * 1024 * 1024))
+        write_time = time.time() - start_io
+        disk_speed = (50 / write_time)
+        os.remove('speed_test.tmp')
+    except:
+        disk_speed = 0
+
+    info_text = f"""
+    <div style="background-color: #2b2b2b; color: white; padding: 10px; border-radius: 5px;">
+    <b> Processor:</b> {device_name} <br>
+    <b> Memory (RAM):</b> {ram_used:.1f} GB Used / {ram_total:.1f} GB Total <br>
+    <b> Storage:</b> {disk_free:.1f} GB Free (Write Speed: ~{disk_speed:.0f} MB/s)
+    </div>
+    """
+    return info_text
+
+def update_prog_info(current, total, start_time, action_name):
+    # Simple and robust progress calculator
+    elapsed = time.time() - start_time
+    if elapsed < 0.001: elapsed = 0.001
+
+    percent = (current / total) * 100
+
+    # Calculate ETA
+    if current > 0:
+        rate = elapsed / current # seconds per item
+        remaining_items = total - current
+        eta_seconds = remaining_items * rate
+    else:
+        eta_seconds = 0
+
+    return f"{action_name} | {percent:.1f}% | Elapsed: {format_time(elapsed)} | ETA: {format_time(eta_seconds)}"
+
+# --- 5. Autoencoder ---
+class Autoencoder(nn.Module):
+    def __init__(self, target_dim=64):
+        super(Autoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(768, 256),
+            nn.ReLU(),
+            nn.Linear(256, target_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(target_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 768)
+        )
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x
+    def encode(self, x):
+        return self.encoder(x)
+
+# --- 6. Core Logic ---
+runtime_data = {}
+
+# Helper to find all images recursively
+def find_all_images(directory):
+    image_paths = []
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                image_paths.append(os.path.join(root, file))
+    return image_paths
+
+def download_datasets(history, progress=gr.Progress()):
+    start_time = time.time()
+
+    # Check if directories exist
+    if not os.path.exists(BASE_DIR):
+        os.makedirs(IMAGES_DIR, exist_ok=True)
+        os.makedirs(GT_DIR, exist_ok=True)
+
+    # Check if images are already downloaded using recursive search
+    existing_images = []
+    if os.path.exists(IMAGES_DIR):
+        existing_images = find_all_images(IMAGES_DIR)
+
+    # Threshold check: Oxford is ~5k, Paris ~6k. If < 10k, we likely need to download.
+    is_missing_data = len(existing_images) < 10000
+
+    if is_missing_data:
+        progress(0.1, desc="Downloading Oxford 5k...")
+        subprocess.run(["wget", "-q", "https://www.robots.ox.ac.uk/~vgg/data/oxbuildings/oxbuild_images.tgz"], check=True)
+        subprocess.run(["tar", "-xzf", "oxbuild_images.tgz", "-C", IMAGES_DIR], check=True)
+        subprocess.run(["rm", "oxbuild_images.tgz"], check=True)
+
+        progress(0.4, desc="Downloading Paris 6k (Part 1)...")
+        subprocess.run(["wget", "-q", "https://www.robots.ox.ac.uk/~vgg/data/parisbuildings/paris_1.tgz"], check=True)
+        subprocess.run(["tar", "-xzf", "paris_1.tgz", "-C", IMAGES_DIR], check=True)
+        subprocess.run(["rm", "paris_1.tgz"], check=True)
+
+        progress(0.6, desc="Downloading Paris 6k (Part 2)...")
+        subprocess.run(["wget", "-q", "https://www.robots.ox.ac.uk/~vgg/data/parisbuildings/paris_2.tgz"], check=True)
+        subprocess.run(["tar", "-xzf", "paris_2.tgz", "-C", IMAGES_DIR], check=True)
+        subprocess.run(["rm", "paris_2.tgz"], check=True)
+
+        progress(0.8, desc="Downloading GT...")
+        subprocess.run(["wget", "-q", "https://www.robots.ox.ac.uk/~vgg/data/oxbuildings/gt_files_170407.tgz"], check=True)
+        subprocess.run(["tar", "-xzf", "gt_files_170407.tgz", "-C", GT_DIR], check=True)
+        subprocess.run(["rm", "gt_files_170407.tgz"], check=True)
+        subprocess.run(["wget", "-q", "https://www.robots.ox.ac.uk/~vgg/data/parisbuildings/paris_120310.tgz"], check=True)
+        subprocess.run(["tar", "-xzf", "paris_120310.tgz", "-C", GT_DIR], check=True)
+        subprocess.run(["rm", "paris_120310.tgz"], check=True)
+
+        status_msg = " Datasets Downloaded & Merged Successfully."
+    else:
+        status_msg = " Datasets already exist (Count > 10k). Skipping download."
+
+    elapsed = time.time() - start_time
+
+    # --- VERIFICATION STEP (Recursive) ---
+    all_image_paths = find_all_images(IMAGES_DIR)
+    total_count = len(all_image_paths)
+
+    # Check for Paris landmarks in filenames (basename)
+    paris_prefixes = ['defense', 'eiffel', 'general', 'invalides', 'louvre', 'moulinrouge', 'museedorsay', 'notredame', 'pantheon', 'pompidou', 'sacrecoeur', 'triomphe']
+    paris_found = 0
+    for p in all_image_paths:
+        fname = os.path.basename(p).lower()
+        if any(fname.startswith(prefix) for prefix in paris_prefixes):
+            paris_found += 1
+
+    oxford_found = total_count - paris_found
+
+    msg = f"{status_msg}\nLocation: {IMAGES_DIR}\nTotal Time: {format_time(elapsed)}\n\n📊 Verification:\n- Total Images: {total_count}\n- Paris Landmarks Detected: {paris_found}\n- Oxford Landmarks Detected: {oxford_found}"
+
+    return append_log(history, msg), msg # Return to log and status box
+
+def extract_features(history, progress=gr.Progress()):
+    if not os.path.exists(IMAGES_DIR):
+        return append_log(history, "⚠️ Error: Images not found. Please run Step 1 first."), "Error: No images found."
+
+    progress(0, desc="Loading ViT Model...")
+    try:
+        processor = ViTImageProcessor.from_pretrained('google/vit-base-patch16-224')
+        model = ViTModel.from_pretrained('google/vit-base-patch16-224').to(device)
+        model.eval()
+    except Exception as e:
+        return append_log(history, f" Model Load Error: {str(e)}"), "Model Error"
+
+    # RECURSIVE SEARCH FOR IMAGES
+    image_paths = find_all_images(IMAGES_DIR)
+    total = len(image_paths)
+
+    if total == 0: return append_log(history, " Error: Image folder is empty."), "Error: Empty folder"
+
+    features, names = [], []
+    start_time = time.time()
+
+    for i, img_path in enumerate(image_paths):
+        # Update progress less frequently to save UI performance
+        if i % 50 == 0:
+            desc = update_prog_info(i, total, start_time, "Extracting Features")
+            progress(i / total, desc=desc)
+
+        try:
+            image = Image.open(img_path).convert("RGB")
+            inputs = processor(images=image, return_tensors="pt").to(device)
+            with torch.no_grad():
+                outputs = model(**inputs)
+            feat = outputs.last_hidden_state[0, 0, :].cpu().numpy()
+            features.append(feat)
+            # IMPORTANT: Store only the basename for GT matching (e.g. 'all_souls_000000.jpg')
+            names.append(os.path.basename(img_path))
+        except: continue
+
+    features_np = np.array(features)
+    names_np = np.array(names)
+    np.save(FEATURES_FILE, features_np)
+    np.save(NAMES_FILE, names_np)
+    runtime_data['base'] = features_np
+    runtime_data['names'] = names_np
+
+    elapsed = time.time() - start_time
+    msg = f" Feature Extraction Complete.\nProcessed Images: {len(features)}\nFeature Vector Size: 768-D\nTotal Time: {format_time(elapsed)}"
+    return append_log(history, msg), f"Done. Processed {len(features)} images."
+
+def compress_and_train(history, epochs_count, patience, progress=gr.Progress()):
+    if not os.path.exists(FEATURES_FILE):
+        return append_log(history, " Error: No features found. Please run Step 2 first."), "Error: No features."
+
+    if 'base' not in runtime_data:
+        runtime_data['base'] = np.load(FEATURES_FILE)
+        runtime_data['names'] = np.load(NAMES_FILE)
+    features_base = runtime_data['base']
+    start_all = time.time()
+
+    runtime_data['pca'] = {}
+    runtime_data['ae'] = {}
+    runtime_data['pq'] = {}
+
+    log_buffer = ["Starting Compression Protocols..."]
+
+    # 1. Train PCA & PQ
+    for i, dim in enumerate(DIMS_TO_TEST):
+        progress(0.1 + (i*0.05), desc=f"Training PCA ({dim}-D)...")
+        pca = PCA(n_components=dim)
+        runtime_data['pca'][dim] = pca.fit_transform(features_base)
+
+        progress(0.1 + (i*0.05) + 0.02, desc=f"Training PQ (M={dim})...")
+        M = dim
+        nbits = 8
+        index_pq = faiss.IndexPQ(768, M, nbits)
+        index_pq.train(features_base)
+        index_pq.add(features_base)
+        runtime_data['pq'][dim] = index_pq
+
+    log_buffer.append(" PCA & PQ Models Trained successfully.")
+
+    # 2. Train Autoencoders
+    tensor_x = torch.Tensor(features_base)
+    dataset_size = len(tensor_x)
+    val_size = int(0.1 * dataset_size)
+    train_size = dataset_size - val_size
+    train_dataset, val_dataset = random_split(TensorDataset(tensor_x, tensor_x), [train_size, val_size])
+    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False)
+
+    for i, dim in enumerate(DIMS_TO_TEST):
+        start_ae_dim = time.time()
+
+        model_ae = Autoencoder(target_dim=dim).to(device)
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(model_ae.parameters(), lr=0.001)
+        epochs = int(epochs_count)
+        patience_val = int(patience)
+        best_val_loss = float('inf')
+        patience_counter = 0
+
+        for epoch in range(epochs):
+            model_ae.train()
+            train_loss = 0.0
+            for data in train_loader:
+                inputs, _ = data
+                inputs = inputs.to(device)
+                optimizer.zero_grad()
+                outputs = model_ae(inputs)
+                loss = criterion(outputs, inputs)
+                loss.backward()
+                if 'xla' in str(device) or 'tpu' in str(device).lower():
+                    xm.optimizer_step(optimizer)
+                    xm.mark_step()
+                else: optimizer.step()
+                train_loss += loss.item()
+
+            model_ae.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for data in val_loader:
+                    inputs, _ = data
+                    inputs = inputs.to(device)
+                    outputs = model_ae(inputs)
+                    loss = criterion(outputs, inputs)
+                    val_loss += loss.item()
+
+            avg_val = val_loss / len(val_loader)
+
+            info_str = update_prog_info(epoch + 1, epochs, start_ae_dim, f"AE-{dim}")
+            desc = f"{info_str} | Loss: {avg_val:.4f}"
+
+            fraction = 0.3 + (i * 0.2) + (0.2 * ((epoch + 1) / epochs))
+            progress(fraction, desc=desc)
+
+            if avg_val < best_val_loss:
+                best_val_loss = avg_val
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience_val:
+                log_buffer.append(f"  - AE-{dim}: Early Stopped at Epoch {epoch+1} (Best Val Loss: {best_val_loss:.5f})")
+                break
+
+        if patience_counter < patience_val:
+             log_buffer.append(f"  - AE-{dim}: Completed {epochs} Epochs (Best Val Loss: {best_val_loss:.5f})")
+
+        with torch.no_grad():
+            tensor_all = torch.Tensor(features_base).to(device)
+            features_ae = model_ae.encode(tensor_all).cpu().numpy()
+            runtime_data['ae'][dim] = features_ae
+
+    total_time = time.time() - start_all
+    msg = f" All Training Complete.\nTotal Time: {format_time(total_time)}\nDetails:\n" + "\n".join(log_buffer)
+    return append_log(history, msg), "Training Finished."
+
+def evaluate_system(history, progress=gr.Progress()):
+    if 'pca' not in runtime_data:
+        return [None, None, append_log(history, " Error: Training not finished. Run Step 3."), "Error"]
+
+    image_names = runtime_data['names']
+    name_to_index = {name.replace('.jpg', ''): i for i, name in enumerate(image_names)}
+
+    # Load Queries
+    queries = []
+    if not os.path.exists(GT_DIR):
+        return [None, None, append_log(history, " Error: GT files missing."), "Error"]
+
+    for f in os.listdir(GT_DIR):
+        if f.endswith('_query.txt'):
+            q_name = f.replace('_query.txt', '')
+            with open(os.path.join(GT_DIR, f)) as qf:
+                line = qf.readline().split()[0].replace('oxc1_', '').replace('paris_', '')
+                queries.append((q_name, line))
+
+    results_list = []
+
+    def eval_method(name, features_dict, dim_val, method_type='vector'):
+        if method_type == 'pq':
+            index = features_dict
+            n_samples = len(image_names)
+            size_mb = (n_samples * dim_val) / (1024*1024)
+        else:
+            features = features_dict
+            n_samples = len(image_names)
+            size_mb = (n_samples * dim_val * 4) / (1024*1024)
+            nbrs = NearestNeighbors(n_neighbors=n_samples, metric='euclidean', algorithm='brute').fit(features)
+
+        aps, latencies = [], []
+        for q_label, q_img_name in queries:
+            if q_img_name not in name_to_index: continue
+            q_idx = name_to_index[q_img_name]
+            start = time.time()
+
+            if method_type == 'pq':
+                base_feat = runtime_data['base'][q_idx].reshape(1, -1)
+                dists, inds = index.search(base_feat, n_samples)
+            else:
+                q_vec = features[q_idx].reshape(1, -1)
+                dists, inds = nbrs.kneighbors(q_vec)
+
+            latencies.append((time.time() - start) * 1000)
+
+            try:
+                ok = {l.strip() for l in open(os.path.join(GT_DIR, f'{q_label}_ok.txt'))}
+                good = {l.strip() for l in open(os.path.join(GT_DIR, f'{q_label}_good.txt'))}
+                junk = {l.strip() for l in open(os.path.join(GT_DIR, f'{q_label}_junk.txt'))}
+                positives = ok | good
+                y_true, y_scores = [], []
+                for rank, idx in enumerate(inds[0]):
+                    r_name = image_names[idx].replace('.jpg', '')
+                    if r_name == q_img_name or r_name in junk: continue
+                    y_true.append(1 if r_name in positives else 0)
+                    y_scores.append(-dists[0][rank] if method_type != 'pq' else -dists[0][rank])
+                if sum(y_true) > 0: aps.append(average_precision_score(y_true, y_scores))
+            except: continue
+        return {'Method': name, 'Dim': dim_val, 'mAP': np.mean(aps), 'Size (MB)': size_mb, 'Time (ms)': np.mean(latencies)}
+
+    # Evaluations
+    progress(0.1, desc="Eval Baseline...")
+    results_list.append(eval_method("Baseline", runtime_data['base'], 768))
+
+    for i, dim in enumerate(DIMS_TO_TEST):
+        progress(0.2 + (i*0.1), desc=f"Eval {dim}-D...")
+        results_list.append(eval_method(f"PCA-{dim}", runtime_data['pca'][dim], dim))
+        results_list.append(eval_method(f"AE-{dim}", runtime_data['ae'][dim], dim))
+        results_list.append(eval_method(f"PQ-{dim}", runtime_data['pq'][dim], dim, method_type='pq'))
+
+    # Create DataFrame
+    df = pd.DataFrame(results_list)
+    df = df.round({'mAP': 4, 'Size (MB)': 2, 'Time (ms)': 2})
+
+    # --- Generate Multiple Research Plots ---
+    plot_images = []
+    plt.style.use('default')
+
+    # 1. Accuracy Plot
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(df['Method'], df['mAP'], color='#2196F3')
+    plt.title('Retrieval Accuracy (mAP)')
+    plt.xticks(rotation=45, ha='right')
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120)
+    buf.seek(0)
+    plot_images.append(Image.open(buf))
+    plt.close()
+
+    # 2. Size Plot
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(df['Method'], df['Size (MB)'], color='#4CAF50')
+    plt.title('Storage Size (MB)')
+    plt.xticks(rotation=45, ha='right')
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.2f}', ha='center', va='bottom')
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120)
+    buf.seek(0)
+    plot_images.append(Image.open(buf))
+    plt.close()
+
+    # 3. Compression Ratio Plot
+    baseline_size = df[df['Method'] == 'Baseline']['Size (MB)'].values[0]
+    df['Compression Ratio'] = baseline_size / df['Size (MB)']
+
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(df['Method'], df['Compression Ratio'], color='#FF9800')
+    plt.title('Compression Ratio (X times smaller than Baseline)')
+    plt.xticks(rotation=45, ha='right')
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.1f}x', ha='center', va='bottom')
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120)
+    plot_images.append(Image.open(buf))
+    plt.close()
+
+    # 4. Trade-off Bubble Chart
+    plt.figure(figsize=(10, 6))
+    bubble_sizes = [s * 30 + 100 for s in df['Size (MB)']]
+    scatter = plt.scatter(df['Time (ms)'], df['mAP'], s=bubble_sizes,
+                         c=range(len(df)), cmap='viridis', alpha=0.7, edgecolors='black')
+    plt.title('Trade-off: Speed (x) vs Accuracy (y) [Bubble Size = Storage]')
+    plt.xlabel('Time (ms)')
+    plt.ylabel('mAP')
+    plt.grid(True, linestyle='--', alpha=0.5)
+    for i, txt in enumerate(df['Method']):
+        plt.annotate(txt, (df['Time (ms)'][i], df['mAP'][i]),
+                    xytext=(5, 5), textcoords='offset points', fontsize=9)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120)
+    plot_images.append(Image.open(buf))
+    plt.close()
+
+    msg = f" Evaluation Complete.\nBest Accuracy: {df['mAP'].max()}\nBest Compression: {df['Compression Ratio'].max():.1f}x"
+    return [plot_images, df, append_log(history, msg), "Analysis Done"]
+
+# --- 7. Gradio UI (Restored & Enhanced) ---
+custom_css = """
+.gradio-container {background-color: #f8f9fa}
+h1 {text-align: center; color: #2c3e50;}
+.tabs {margin-top: 20px;}
+"""
+with gr.Blocks(title="Research Benchmarking Tool", css=custom_css) as app:
+    gr.Markdown("#  Research Benchmarking: Image Retrieval bu Hamdi A. Jaber")
+    gr.Markdown("### Comprehensive Analysis Tool")
+
+    # State to hold logs
+    log_state = gr.State("")
+
+    with gr.Accordion(" Hardware Details (System Info)", open=True):
+        hw_info = gr.HTML(value=get_system_metrics())
+        refresh_btn = gr.Button(" Refresh Status", size="sm")
+        refresh_btn.click(get_system_metrics, outputs=hw_info)
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("### 🛠️ Experiment Controls")
+
+            # Added Status Box for immediate visibility
+            status_box = gr.Textbox(label="Current Operation Status", value="Ready to start.", interactive=False)
+
+            # 1. Fetch
+            gr.Markdown("**1. Fetch Data:** Download and merge Oxford 5k & Paris 6k.")
+            btn_dl = gr.Button("1. Download Datasets", variant="primary")
+
+            # 2. Extract
+            gr.Markdown("**2. Extract:** Convert images to 768-D vectors via ViT.")
+            btn_ext = gr.Button("2. Extract Features", variant="secondary")
+
+            # 3. Train
+            gr.Markdown("**3. Compress:** Train Models (PCA, PQ, Autoencoder).")
+            epochs_slider = gr.Slider(10, 200, value=50, step=10, label="Max Epochs")
+            patience_slider = gr.Slider(2, 20, value=5, step=1, label="Early Stopping Patience")
+            btn_comp = gr.Button("3. Train All Models", variant="secondary")
+
+            # 4. Eval
+            gr.Markdown("**4. Results:** Calculate Accuracy, Size, and Speed.")
+            btn_eval = gr.Button("4. Generate Research Report", variant="stop")
+
+        with gr.Column(scale=3):
+            with gr.Tabs():
+                with gr.TabItem(" Research Plots (Gallery)"):
+                    plot_gallery = gr.Gallery(label="Performance Charts", columns=2, height="auto")
+                with gr.TabItem(" Results Table"):
+                    result_table = gr.Dataframe(label="Detailed Metrics", interactive=False)
+                with gr.TabItem(" System Logs"):
+                    log_output = gr.Textbox(label="Execution History", lines=15)
+
+    # Linking buttons with State and Status Box
+    btn_dl.click(download_datasets, inputs=[log_state], outputs=[log_state, status_box]) \
+          .then(lambda x: x, inputs=[log_state], outputs=[log_output])
+
+    btn_ext.click(extract_features, inputs=[log_state], outputs=[log_state, status_box]) \
+           .then(lambda x: x, inputs=[log_state], outputs=[log_output])
+
+    btn_comp.click(compress_and_train, inputs=[log_state, epochs_slider, patience_slider], outputs=[log_state, status_box]) \
+            .then(lambda x: x, inputs=[log_state], outputs=[log_output])
+
+    btn_eval.click(evaluate_system, inputs=[log_state], outputs=[plot_gallery, result_table, log_state, status_box]) \
+            .then(lambda x: x, inputs=[log_state], outputs=[log_output])
+
+print(" Launching Research Interface...")
+app.launch(share=True, debug=True)
